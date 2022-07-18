@@ -40,7 +40,7 @@ android {
 }
 
 dependencies {
-    api 'com.github.marciogranzotto.paho-mqtt-java:org.eclipse.paho.client.mqttv3:7a71af1f4c'
+    api 'com.github.marciogranzotto.paho-mqtt-java:org.eclipse.paho.client.mqttv3:1cbf759b4c'
     implementation 'androidx.legacy:legacy-support-v4:1.0.0'
     implementation "androidx.core:core-ktx:1.8.0"
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.3"
