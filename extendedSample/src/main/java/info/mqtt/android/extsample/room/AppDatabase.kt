@@ -24,9 +24,10 @@ abstract class AppDatabase : RoomDatabase() {
 
         const val DB_VERSION = 1
         private var db: AppDatabase? = null
+        const val DB_NAME = "persistenceMQ"
 
         @Synchronized
-        fun getDatabase(context: Context, storageName: String = "persistenceMQ"): AppDatabase {
+        fun getDatabase(context: Context, storageName: String = DB_NAME): AppDatabase {
             return db?.let {
                 it
             } ?: run {
@@ -34,8 +35,7 @@ abstract class AppDatabase : RoomDatabase() {
                     context.applicationContext,
                     AppDatabase::class.java,
                     storageName
-                ).allowMainThreadQueries()
-                    .build()
+                ).build()
                 db!!
             }
         }

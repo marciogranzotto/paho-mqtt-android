@@ -7,6 +7,9 @@ import android.os.PowerManager
 import android.os.PowerManager.WakeLock
 import android.util.Log
 import info.mqtt.android.service.ping.AlarmPingSender
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.eclipse.paho.client.mqttv3.*
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import org.eclipse.paho.client.mqttv3.persist.MqttDefaultFilePersistence
@@ -45,7 +48,9 @@ import java.util.*
  */
 internal class MqttConnection(
     private val service: MqttService, // fields for the connection definition
-    var serverURI: String, var clientId: String, private var persistence: MqttClientPersistence?, // Client handle, used for callbacks...
+    var serverURI: String,
+    var clientId: String,
+    private var persistence: MqttClientPersistence?, // Client handle, used for callbacks...
     var clientHandle: String
 ) : MqttCallbackExtended {
     // Saved sent messages and their corresponding Topics, activityTokens and
@@ -85,12 +90,14 @@ internal class MqttConnection(
     fun connect(options: MqttConnectOptions?, invocationContext: String?, activityToken: String?) {
         connectOptions = options
         reconnectActivityToken = activityToken
-        if (options != null) {
-            cleanSession = options.isCleanSession
-            if (options.isCleanSession) { // if it's a clean session,
+        options?.let {
+            cleanSession = it.isCleanSession
+            if (it.isCleanSession) { // if it's a clean session,
                 // discard old data
                 if (service.messageDatabase.isOpen)
-                    service.messageDatabase.persistenceDao().deleteClientHandle(clientHandle)
+                    CoroutineScope(Dispatchers.IO).launch {
+                        service.messageDatabase.persistenceDao().deleteClientHandle(clientHandle)
+                    }
                 else
                     Timber.w("Database is closed")
             }
@@ -108,8 +115,7 @@ internal class MqttConnection(
                 // use internal storage instead.
                 try {
                     myDir = service.getDir(TEMP, Context.MODE_PRIVATE)
-                } catch (e: Exception) {
-                    //skip
+                } catch (ignored: Exception) {
                 }
                 if (myDir == null) {
                     try {
@@ -160,11 +166,11 @@ internal class MqttConnection(
                 }
             } else {
                 alarmPingSender = AlarmPingSender(service)
+                setConnectingState(true)
                 myClient = MqttAsyncClient(serverURI, clientId, persistence, alarmPingSender)
                 //, null,	new AndroidHighResolutionTimer());
                 myClient!!.setCallback(this)
                 service.traceDebug("Do Real connect!")
-                setConnectingState(true)
                 myClient!!.connect(connectOptions, invocationContext, listener)
             }
         } catch (e: Exception) {
@@ -212,10 +218,12 @@ internal class MqttConnection(
      * have already purged any such messages from our messageStore.
      */
     private fun deliverBacklog() {
-        service.messageDatabase.persistenceDao().allArrived(clientHandle).forEach {
-            val resultBundle = messageToBundle(it.messageId, it.topic, it.mqttMessage)
-            resultBundle.putString(MqttServiceConstants.CALLBACK_ACTION, MqttServiceConstants.MESSAGE_ARRIVED_ACTION)
-            service.callbackToActivity(clientHandle, Status.OK, resultBundle)
+        CoroutineScope(Dispatchers.IO).launch {
+            service.messageDatabase.persistenceDao().allArrived(clientHandle).forEach {
+                val resultBundle = messageToBundle(it.messageId, it.topic, it.mqttMessage)
+                resultBundle.putString(MqttServiceConstants.CALLBACK_ACTION, MqttServiceConstants.MESSAGE_ARRIVED_ACTION)
+                service.callbackToActivity(clientHandle, Status.OK, resultBundle)
+            }
         }
     }
 
@@ -277,7 +285,9 @@ internal class MqttConnection(
         }
         if (connectOptions != null && connectOptions!!.isCleanSession) {
             // assume we'll clear the stored messages at this point
-            service.messageDatabase.persistenceDao().deleteClientHandle(clientHandle)
+            CoroutineScope(Dispatchers.IO).launch {
+                service.messageDatabase.persistenceDao().deleteClientHandle(clientHandle)
+            }
         }
         releaseWakeLock()
     }
@@ -309,7 +319,9 @@ internal class MqttConnection(
         }
         if (connectOptions != null && connectOptions!!.isCleanSession) {
             // assume we'll clear the stored messages at this point
-            service.messageDatabase.persistenceDao().deleteClientHandle(clientHandle)
+            CoroutineScope(Dispatchers.IO).launch {
+                service.messageDatabase.persistenceDao().deleteClientHandle(clientHandle)
+            }
         }
         releaseWakeLock()
     }
@@ -473,8 +485,8 @@ internal class MqttConnection(
         messageListeners: Array<IMqttMessageListener>?
     ) {
         service.traceDebug(
-            "subscribe({" + topicFilters.contentToString() + "}," + qos.contentToString() + ",{"
-                    + invocationContext + "}, {" + activityToken + "}"
+            "subscribe({" + topicFilters.contentToString() + "}," + qos.contentToString() + ",{" +
+                    invocationContext + "}, {" + activityToken + "}"
         )
         val resultBundle = Bundle()
         resultBundle.putString(MqttServiceConstants.CALLBACK_ACTION, MqttServiceConstants.SUBSCRIBE_ACTION)
@@ -711,7 +723,7 @@ internal class MqttConnection(
      * multiple times
      */
     @Synchronized
-    fun reconnect() {
+    fun reconnect(context: Context) {
         if (myClient == null) {
             service.traceError("Reconnect myClient = null. Will not do reconnect")
             return
@@ -720,7 +732,7 @@ internal class MqttConnection(
             service.traceDebug("The client is connecting. Reconnect return directly.")
             return
         }
-        if (!service.isOnline) {
+        if (!service.isOnline(context)) {
             service.traceDebug("The network is not reachable. Will not do reconnect")
             return
         }
@@ -731,12 +743,16 @@ internal class MqttConnection(
             resultBundle.putString(MqttServiceConstants.CALLBACK_ACTIVITY_TOKEN, reconnectActivityToken)
             resultBundle.putString(MqttServiceConstants.CALLBACK_INVOCATION_CONTEXT, null)
             resultBundle.putString(MqttServiceConstants.CALLBACK_ACTION, MqttServiceConstants.CONNECT_ACTION)
-            try {
-                myClient!!.reconnect()
-            } catch (ex: MqttException) {
-                Timber.e(ex, "Exception occurred attempting to reconnect: ${ex.message}")
-                setConnectingState(false)
-                handleException(resultBundle, ex)
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    myClient!!.reconnect()
+                } catch (ex: MqttException) {
+                    CoroutineScope(Dispatchers.Main).launch {
+                        Timber.e(ex, "Exception occurred attempting to reconnect: ${ex.message}")
+                        setConnectingState(false)
+                        handleException(resultBundle, ex)
+                    }
+                }
             }
         } else if (disconnected && !cleanSession) {
             // use the activityToke the same with action connect

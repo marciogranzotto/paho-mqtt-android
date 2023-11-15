@@ -1,0 +1,86 @@
+name: Pull request
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  Build:
+    name: Test
+    runs-on:  ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ARM64 ]
+        api: [ 34 ]
+        abi: [ arm64-v8a ]
+        tag: [ 'google_apis' ]
+#        include:
+#          - os: macOS-latest
+#            abi: x86_64
+#            api: 28
+#            tag: 'default'
+    steps:
+      - uses: actions/checkout@v4
+      - name: set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'adopt'
+          java-version: 17
+      - name: Install Android SDK
+        uses: hannesa2/action-android/install-sdk@0.1.4.10
+      - name: Run tests
+        run: ./gradlew test
+      - name: Android Emulator test
+        uses: hannesa2/action-android/emulator-run-cmd@0.1.4.10
+        with:
+          cmd: ./gradlew cAT --continue
+          api: ${{ matrix.api }}
+          tag: ${{ matrix.tag }}
+          abi: ${{ matrix.abi }}
+          cmdOptions: -noaudio -no-boot-anim -no-window
+          bootTimeout: 720
+      - uses: actions/upload-artifact@v3
+        if: ${{ always() }}
+        with:
+          name: MQ-Espresso-${{ matrix.api }}-${{ matrix.abi }}-report
+          path: |
+            ./**/build/reports/androidTests/connected
+            ./**/build/outputs/androidTest-results/connected
+      - name: Archive screenshots
+        uses: actions/upload-artifact@v3
+        if: ${{ always() }}
+        with:
+          name: MQ-Screenshots-${{ matrix.api }}-${{ matrix.abi }}
+          path: |
+            basicSample/build/outputs/connected_android_test_additional_output/debugAndroidTest/connected
+            basicSample/build/outputs/androidTest-results/connected
+            extendedSample/build/outputs/connected_android_test_additional_output/debugAndroidTest/connected
+            extendedSample/build/outputs/androidTest-results/connected
+            serviceLibrary/build/outputs/connected_android_test_additional_output/debugAndroidTest/connected
+            serviceLibrary/build/outputs/androidTest-results/connected
+  Check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'adopt'
+          java-version: 17
+      - name: Install Android SDK
+        uses: hannesa2/action-android/install-sdk@0.1.4.10
+      - name: Kotlin code checks
+        run: ./gradlew ktlintCheck
+      - name: Code checks
+        run: ./gradlew check
+      - name: Archive Lint report
+        uses: actions/upload-artifact@v3
+        if: ${{ always() }}
+        with:
+          name: MQTT-Lint-report
+          path: ./**/build/reports/lint-results*.html

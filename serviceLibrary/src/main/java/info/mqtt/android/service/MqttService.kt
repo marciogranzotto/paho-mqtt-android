@@ -8,13 +8,20 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import info.mqtt.android.service.room.MqMessageDatabase
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.launch
 import org.eclipse.paho.client.mqttv3.*
+import timber.log.Timber
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -173,7 +180,7 @@ import java.util.concurrent.ConcurrentHashMap
 @SuppressLint("Registered")
 class MqttService : Service(), MqttTraceHandler {
     // mapping from client handle strings to actual client connections.
-    private val connections: MutableMap<String, MqttConnection> = ConcurrentHashMap()
+    internal val connections: MutableMap<String, MqttConnection> = ConcurrentHashMap()
 
     // somewhere to persist received messages until we're sure that they've reached the application
     lateinit var messageDatabase: MqMessageDatabase
@@ -186,14 +193,17 @@ class MqttService : Service(), MqttTraceHandler {
     // An intent receiver to deal with changes in network connectivity
     private var networkConnectionMonitor: NetworkConnectionIntentReceiver? = null
 
-    @Volatile
-    private var backgroundDataEnabled = true
+    private var mqttServiceBinder: MqttServiceBinder? = null
 
-    var mqttServiceBinder: MqttServiceBinder? = null
+    private var serviceJob: Job? = null
+    private var serviceScope: CoroutineScope? = null
+    private val flow: MutableSharedFlow<Bundle> = MutableSharedFlow()
 
     override fun onCreate() {
         super.onCreate()
-
+        val supervisorJob = SupervisorJob()
+        serviceJob = supervisorJob
+        serviceScope = CoroutineScope(Dispatchers.Main + supervisorJob)
         // create a binder that will let the Activity UI send commands to the Service
         mqttServiceBinder = MqttServiceBinder(this)
 
@@ -201,16 +211,15 @@ class MqttService : Service(), MqttTraceHandler {
         messageDatabase = MqMessageDatabase.getDatabase(this)
     }
 
-
     override fun onDestroy() {
+        Timber.i("Destroy service")
         for (client in connections.values) {
             client.disconnect(null, null)
         }
-
-        // clear down
-        if (mqttServiceBinder != null) {
-            mqttServiceBinder = null
-        }
+        serviceJob?.cancel()
+        serviceJob = null
+        serviceScope = null
+        mqttServiceBinder = null
         unregisterBroadcastReceivers()
         // messageDatabase.close()
         super.onDestroy()
@@ -239,7 +248,7 @@ class MqttService : Service(), MqttTraceHandler {
     }
 
     /**
-     * pass data back to the Activity, by building a suitable Intent object and broadcasting it
+     * pass data back to the Activity, by flow
      *
      * @param clientHandle source of the data
      * @param status       OK or Error
@@ -247,15 +256,16 @@ class MqttService : Service(), MqttTraceHandler {
      */
     fun callbackToActivity(clientHandle: String, status: Status, dataBundle: Bundle) {
         // Don't call traceDebug, as it will try to callbackToActivity leading to recursion.
-        val callbackIntent = Intent(MqttServiceConstants.CALLBACK_TO_ACTIVITY)
-        clientHandle.let {
-            callbackIntent.putExtra(MqttServiceConstants.CALLBACK_CLIENT_HANDLE, it)
+        val bundle = Bundle(dataBundle)
+        bundle.putString(MqttServiceConstants.CALLBACK_CLIENT_HANDLE, clientHandle)
+        bundle.putSerializable(MqttServiceConstants.CALLBACK_STATUS, status)
+        serviceScope?.launch {
+            flow.emit(bundle)
         }
-        callbackIntent.putExtra(MqttServiceConstants.CALLBACK_STATUS, status)
-        dataBundle.let {
-            callbackIntent.putExtras(it)
-        }
-        LocalBroadcastManager.getInstance(this).sendBroadcast(callbackIntent)
+    }
+
+    suspend fun collect(block: (Bundle) -> Unit) {
+        flow.collect(block)
     }
 
     /**
@@ -286,15 +296,17 @@ class MqttService : Service(), MqttTraceHandler {
     @Throws(MqttException::class)
     fun connect(clientHandle: String, connectOptions: MqttConnectOptions?, activityToken: String?) {
         val client = getConnection(clientHandle)
-        client.connect(connectOptions, null, activityToken)
+        CoroutineScope(Dispatchers.IO).launch {
+            client.connect(connectOptions, null, activityToken)
+        }
     }
 
-    fun reconnect() {
+    fun reconnect(context: Context) {
         traceDebug("Reconnect to server, client size=" + connections.size)
         for (client in connections.values) {
             traceDebug("Reconnect Client:" + client.clientId + '/' + client.serverURI)
-            if (isOnline) {
-                client.reconnect()
+            if (isOnline(context)) {
+                client.reconnect(context)
             }
         }
     }
@@ -477,7 +489,7 @@ class MqttService : Service(), MqttTraceHandler {
      * @return the MqttConnection identified by this handle
      */
     private fun getConnection(clientHandle: String): MqttConnection {
-        return connections[clientHandle] ?: throw IllegalArgumentException("Invalid ClientHandle")
+        return connections[clientHandle] ?: throw IllegalArgumentException("Invalid ClientHandle >$clientHandle<")
     }
 
     /**
@@ -565,17 +577,42 @@ class MqttService : Service(), MqttTraceHandler {
         }
     }
 
-    val isOnline: Boolean
-        get() {
-            val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
-            val networkInfo = cm.activeNetworkInfo
-            return networkInfo != null && networkInfo.isAvailable && networkInfo.isConnected && backgroundDataEnabled
-        }
+    fun isOnline(context: Context) = isInternetAvailable(context)
 
     private fun notifyClientsOffline() {
-        for (connection in connections.values) {
-            connection.offline()
+        connections.values.forEach {
+            it.offline()
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun isInternetAvailable(context: Context): Boolean {
+        var result = false
+        val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val networkCapabilities = connectivityManager.activeNetwork ?: return false
+            val actNw = connectivityManager.getNetworkCapabilities(networkCapabilities) ?: return false
+            result = when {
+                actNw.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> true
+                actNw.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> true
+                actNw.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> true
+                else -> false
+            }
+        } else {
+            connectivityManager.run {
+                connectivityManager.activeNetworkInfo?.run {
+                    result = when (type) {
+                        ConnectivityManager.TYPE_WIFI -> true
+                        ConnectivityManager.TYPE_MOBILE -> true
+                        ConnectivityManager.TYPE_ETHERNET -> true
+                        else -> false
+                    }
+
+                }
+            }
+        }
+
+        return result
     }
 
     /**
@@ -586,25 +623,15 @@ class MqttService : Service(), MqttTraceHandler {
         client.setBufferOpts(bufferOpts)
     }
 
-    fun getBufferedMessageCount(clientHandle: String): Int {
-        val client = getConnection(clientHandle)
-        return client.bufferedMessageCount
-    }
+    fun getBufferedMessageCount(clientHandle: String) = getConnection(clientHandle).bufferedMessageCount
 
-    fun getBufferedMessage(clientHandle: String, bufferIndex: Int): MqttMessage {
-        val client = getConnection(clientHandle)
-        return client.getBufferedMessage(bufferIndex)
-    }
+    fun getBufferedMessage(clientHandle: String, bufferIndex: Int): MqttMessage = getConnection(clientHandle).getBufferedMessage(bufferIndex)
 
     fun deleteBufferedMessage(clientHandle: String, bufferIndex: Int) {
-        val client = getConnection(clientHandle)
-        client.deleteBufferedMessage(bufferIndex)
+        getConnection(clientHandle).deleteBufferedMessage(bufferIndex)
     }
 
-    fun getInFlightMessageCount(clientHandle: String): Int {
-        val client = getConnection(clientHandle)
-        return client.inFlightMessageCount
-    }
+    fun getInFlightMessageCount(clientHandle: String) = getConnection(clientHandle).inFlightMessageCount
 
     /*
      * Called in response to a change in network connection - after losing a
@@ -622,10 +649,10 @@ class MqttService : Service(), MqttTraceHandler {
             val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MQTT:tag")
             wl.acquire(10 * 60 * 1000L /*10 minutes*/)
             traceDebug("Reconnect for Network recovery.")
-            if (isOnline) {
+            if (isOnline(context)) {
                 traceDebug("Online,reconnect.")
                 // we have an internet connection - have another try at connecting
-                reconnect()
+                reconnect(context)
             } else {
                 notifyClientsOffline()
             }

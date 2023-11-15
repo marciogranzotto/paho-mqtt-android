@@ -6,8 +6,15 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.util.SparseArray
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import info.mqtt.android.service.extension.parcelable
+import info.mqtt.android.service.extension.serializable
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import org.eclipse.paho.client.mqttv3.*
+import timber.log.Timber
 import java.io.IOException
 import java.io.InputStream
 import java.security.KeyManagementException
@@ -15,11 +22,11 @@ import java.security.KeyStore
 import java.security.KeyStoreException
 import java.security.NoSuchAlgorithmException
 import java.security.cert.CertificateException
-import java.util.*
-import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.TrustManagerFactory
+
 
 /**
  * Enables an android application to communicate with an MQTT server using non-blocking methods.
@@ -36,8 +43,10 @@ import javax.net.ssl.TrustManagerFactory
  *  * disconnect
  *
  */
-class MqttAndroidClient(val context: Context, private val serverURI: String, private val clientId: String, ackType: Ack = Ack.AUTO_ACK) :
-    BroadcastReceiver(), IMqttAsyncClient {
+class MqttAndroidClient @JvmOverloads constructor(
+    val context: Context, private val serverURI: String, private val clientId: String, ackType: Ack = Ack.AUTO_ACK,
+    private var persistence: MqttClientPersistence? = null
+) : IMqttAsyncClient {
 
     // Listener for when the service is connected or disconnected
     private val serviceConnection = MyServiceConnection()
@@ -54,7 +63,6 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
     // An identifier for the underlying client connection, which we can pass to the service
     private var clientHandle: String? = null
     private var tokenNumber = 0
-    private var persistence: MqttClientPersistence? = null
     private var clientConnectOptions: MqttConnectOptions? = null
     private var connectToken: IMqttToken? = null
 
@@ -64,15 +72,16 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
     private var traceEnabled = false
 
     @Volatile
-    private var receiverRegistered = false
+    private var receiverRegistered = AtomicBoolean(false)
 
     @Volatile
     private var serviceBound = false
 
     // notification for Foreground Service
-    private var foregroundServiceNotificationId = -1
     private var foregroundServiceNotification: Notification? = null
 
+    private var clientJob: Job? = null
+    private var clientScope: CoroutineScope? = null
     /**
      * Constructor- create an MqttAndroidClient that can be used to communicate
      * with an MQTT server on android
@@ -82,6 +91,7 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
      * @param clientId    specifies the name by which this connection should be identified to the server null then the default persistence
      * mechanism is used
      * @param ackType     how the application wishes to acknowledge a message has been processed.
+     * @param persistence specifies the persistence to use mechanism to use, or null to obtain a default.
      */
 
     /**
@@ -198,7 +208,7 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
             var service: Any? = null
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && foregroundServiceNotification != null) {
                 serviceStartIntent.putExtra(MqttService.MQTT_FOREGROUND_SERVICE_NOTIFICATION, foregroundServiceNotification)
-                serviceStartIntent.putExtra(MqttService.MQTT_FOREGROUND_SERVICE_NOTIFICATION_ID, foregroundServiceNotificationId)
+                serviceStartIntent.putExtra(MqttService.MQTT_FOREGROUND_SERVICE_NOTIFICATION_ID, FOREGROUND_ID)
                 service = context.startForegroundService(serviceStartIntent)
             } else {
                 try {
@@ -210,33 +220,36 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
             }
             if (service == null) {
                 val listener = token.actionCallback
-                listener?.onFailure(token, RuntimeException("cannot start service " + SERVICE_NAME))
+                listener?.onFailure(token, RuntimeException("cannot start service $SERVICE_NAME"))
             }
 
             // We bind with BIND_SERVICE_FLAG (0), leaving us the manage the lifecycle
             // until the last time it is stopped by a call to stopService()
             context.bindService(serviceStartIntent, serviceConnection, Context.BIND_AUTO_CREATE)
-            if (!receiverRegistered) {
-                registerReceiver(this)
-            }
         } else {
-            pool.execute {
+            CoroutineScope(Dispatchers.IO).launch {
                 doConnect()
 
                 //Register receiver to show shoulder tap.
-                if (!receiverRegistered) {
-                    registerReceiver(this@MqttAndroidClient)
+                if (!receiverRegistered.get()) {
+                    collect()
                 }
             }
         }
         return token
     }
 
-    private fun registerReceiver(receiver: BroadcastReceiver) {
-        val filter = IntentFilter()
-        filter.addAction(MqttServiceConstants.CALLBACK_TO_ACTIVITY)
-        LocalBroadcastManager.getInstance(context).registerReceiver(receiver, filter)
-        receiverRegistered = true
+    private fun collect() {
+        if (mqttService == null) {
+            return
+        }
+        val supervisorJob = SupervisorJob()
+        clientJob = supervisorJob
+        clientScope = CoroutineScope(Dispatchers.IO + supervisorJob)
+        clientScope?.launch {
+            mqttService?.collect(::onReceive)
+        }
+        receiverRegistered.set(true)
     }
 
     /**
@@ -327,7 +340,7 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
      *
      * This method must not be called from inside [MqttCallback] methods.
      *
-     * The method returns control before the disconnect completes. Completioncan be tracked by:
+     * The method returns control before the disconnect completes. Completion can be tracked by:
      *
      *  * Waiting on the returned token [IMqttToken.waitForCompletion]
      * or
@@ -420,7 +433,7 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
      *  * The connection is re-established with the same clientID
      *  * The original connection was made with (@link MqttConnectOptions#setCleanSession(boolean)} set to false
      *  * The connection is re-established with (@link MqttConnectOptions#setCleanSession(boolean)} set to false
-     *  * Depending when the failure occurs QoS 0 messages may not be elivered.
+     *  * Depending when the failure occurs QoS 0 messages may not be delivered.
      *
      * When building an application, the design of the topic tree should take
      * into account the following principles of topic name syntax and semantics:
@@ -872,9 +885,9 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
      * This method should not be explicitly invoked.
      *
      */
-    override fun onReceive(context: Context, intent: Intent) {
-        val data = intent.extras
-        val handleFromIntent = data!!.getString(MqttServiceConstants.CALLBACK_CLIENT_HANDLE)
+    private fun onReceive(data: Bundle) {
+        Timber.d(data.toString())
+        val handleFromIntent = data.getString(MqttServiceConstants.CALLBACK_CLIENT_HANDLE)
         if (handleFromIntent == null || handleFromIntent != clientHandle) {
             return
         }
@@ -962,7 +975,7 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
      * Process a Connection Lost notification
      */
     private fun connectionLostAction(data: Bundle?) {
-        val reason = data!!.getSerializable(MqttServiceConstants.CALLBACK_EXCEPTION) as Exception?
+        val reason = data!!.parcelable(MqttServiceConstants.CALLBACK_EXCEPTION) as Exception?
         callbacksList.forEach {
             it.connectionLost(reason)
         }
@@ -987,18 +1000,18 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
      */
     private fun simpleAction(token: IMqttToken?, data: Bundle) {
         if (token != null) {
-            val status = data.getSerializable(MqttServiceConstants.CALLBACK_STATUS) as Status?
+            val status = data.serializable(MqttServiceConstants.CALLBACK_STATUS) as Status?
             if (status == Status.OK) {
                 (token as MqttTokenAndroid).notifyComplete()
             } else {
-                val errorMessage = data.getSerializable(MqttServiceConstants.CALLBACK_ERROR_MESSAGE) as String?
-                var exceptionThrown = data.getSerializable(MqttServiceConstants.CALLBACK_EXCEPTION) as Throwable?
+                val errorMessage = data.serializable(MqttServiceConstants.CALLBACK_ERROR_MESSAGE) as String?
+                var exceptionThrown = data.serializable(MqttServiceConstants.CALLBACK_EXCEPTION) as Throwable?
                 if (exceptionThrown == null && errorMessage != null) {
                     exceptionThrown = Throwable(errorMessage)
                 } else if (exceptionThrown == null) {
                     val bundleToString = data.keySet()
                         .joinToString(", ", "{", "}") { key ->
-                            "$key=${data[key]}"
+                            "$key=${data.getString(key)}"
                         }
                     exceptionThrown = Throwable("No Throwable given\n$bundleToString")
                 }
@@ -1041,7 +1054,7 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
      */
     private fun messageDeliveredAction(data: Bundle) {
         val token = removeMqttToken(data)
-        val status = data.getSerializable(MqttServiceConstants.CALLBACK_STATUS) as Status?
+        val status = data.serializable(MqttServiceConstants.CALLBACK_STATUS) as Status?
         if (token != null) {
             if (status == Status.OK && token is IMqttDeliveryToken) {
                 callbacksList.forEach { callback ->
@@ -1057,7 +1070,7 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
     private fun messageArrivedAction(data: Bundle?) {
         val messageId = data!!.getString(MqttServiceConstants.CALLBACK_MESSAGE_ID)!!
         val destinationName = data.getString(MqttServiceConstants.CALLBACK_DESTINATION_NAME)
-        val message: ParcelableMqttMessage = data.getParcelable(MqttServiceConstants.CALLBACK_MESSAGE_PARCEL)!!
+        val message: ParcelableMqttMessage = data.parcelable(MqttServiceConstants.CALLBACK_MESSAGE_PARCEL)!!
         try {
             if (messageAck == Ack.AUTO_ACK) {
                 callbacksList.forEach { callback ->
@@ -1087,7 +1100,7 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
                 MqttServiceConstants.TRACE_DEBUG -> it.traceDebug(message)
                 MqttServiceConstants.TRACE_ERROR -> it.traceError(message)
                 else -> {
-                    val e = data.getSerializable(MqttServiceConstants.CALLBACK_EXCEPTION) as Exception?
+                    val e = data.serializable(MqttServiceConstants.CALLBACK_EXCEPTION) as Exception?
                     it.traceException(message, e)
                 }
             }
@@ -1144,9 +1157,8 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
      *
      * @param notification notification to be used when MqttService runs in foreground mode
      */
-    fun setForegroundService(notification: Notification, id: Int) {
+    fun setForegroundService(notification: Notification) {
         foregroundServiceNotification = notification
-        foregroundServiceNotificationId = id
     }
 
     /**
@@ -1231,16 +1243,18 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
      * IntentReceiver leaks.
      */
     fun unregisterResources() {
-        if (receiverRegistered) {
+        if (receiverRegistered.get()) {
             synchronized(this@MqttAndroidClient) {
-                LocalBroadcastManager.getInstance(context).unregisterReceiver(this)
-                receiverRegistered = false
+                clientJob?.cancel()
+                clientJob = null
+                clientScope = null
+                receiverRegistered.set(false)
             }
             if (serviceBound) {
                 try {
                     context.unbindService(serviceConnection)
                     serviceBound = false
-                } catch (e: IllegalArgumentException) {
+                } catch (ignored: IllegalArgumentException) {
                 }
             }
         }
@@ -1250,8 +1264,8 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
      * Register receiver to receiver intent from MqttService. Call this method when activity is hidden and become to show again.
      */
     fun registerResources() {
-        if (!receiverRegistered) {
-            registerReceiver(this)
+        if (!receiverRegistered.get()) {
+            collect()
         }
     }
 
@@ -1263,19 +1277,21 @@ class MqttAndroidClient(val context: Context, private val serverURI: String, pri
             if (MqttServiceBinder::class.java.isAssignableFrom(binder.javaClass)) {
                 mqttService = (binder as MqttServiceBinder).service
                 serviceBound = true
+                collect()
                 // now that we have the service available, we can actually connect
                 doConnect()
             }
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
+            Timber.d("Service disconnected")
             mqttService = null
         }
     }
 
     companion object {
         private val SERVICE_NAME = MqttService::class.java.name
-        private val pool = Executors.newCachedThreadPool()
+        private const val FOREGROUND_ID = 77
     }
 
 }
